@@ -1,3 +1,4 @@
+# 请复制以下全部内容
 import streamlit as st
 import pandas as pd
 import json
@@ -7,7 +8,6 @@ from datetime import datetime, date
 import io
 import base64
 from PIL import Image
-import tempfile
 
 st.set_page_config(page_title="股票持仓管家", layout="wide", initial_sidebar_state="collapsed")
 
@@ -16,7 +16,6 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER = os.environ.get("REPO_OWNER", "")
 REPO_NAME = os.environ.get("REPO_NAME", "")
 
-# ---------- 数据持久化 ----------
 def load_data():
     if not os.path.exists(DATA_FILE):
         default = {"stocks": {}, "transactions": [], "dividends": []}
@@ -43,7 +42,6 @@ def save_data(data):
         except:
             pass
 
-# ---------- 行情接口 ----------
 def get_realtime_price(stock_code):
     try:
         code = str(stock_code).strip()
@@ -80,7 +78,6 @@ def search_stocks(keyword):
     except:
         return []
 
-# ---------- 核心计算 ----------
 def compute_portfolio(data):
     stocks_info = {}
     transactions = data.get("transactions", [])
@@ -122,7 +119,6 @@ def compute_portfolio(data):
                 stocks_info[code]["total_cost"] -= amount
     return stocks_info
 
-# ---------- 主界面 ----------
 def main():
     st.title("📈 股票持仓管家")
     data = load_data()
@@ -138,7 +134,6 @@ def main():
     with tab5:
         export_data(data)
 
-# ---------- 持仓总览 ----------
 def show_overview(data):
     st.subheader("持仓总览")
     stocks_info = compute_portfolio(data)
@@ -167,7 +162,6 @@ def show_overview(data):
     df = pd.DataFrame(rows)
     st.dataframe(df, width='stretch', hide_index=True)
 
-# ---------- 添加交易（含手动录入和截图录入）----------
 def add_transaction_tab(data):
     sub_tabs = st.tabs(["✏️ 手动录入", "📸 截图录入"])
     with sub_tabs[0]:
@@ -177,23 +171,27 @@ def add_transaction_tab(data):
 
 def manual_add_transaction(data):
     st.subheader("手动添加交易")
-    with st.form("add_trade"):
-        keyword = st.text_input("搜索股票（代码或名称）")
-        col1, col2 = st.columns([3,1])
-        if col1.button("搜索"):
-            results = search_stocks(keyword)
-            if results:
-                st.session_state.results = results
-            else:
-                st.warning("未找到")
-        if "results" in st.session_state and st.session_state.results:
-            opts = [f"{c} - {n}" for c, n in st.session_state.results]
-            sel = st.selectbox("选择", opts)
-            code = sel.split(" - ")[0]
-            name = sel.split(" - ")[1]
+    
+    # 搜索部分放在 form 外部
+    keyword = st.text_input("搜索股票（代码或名称）", key="search_keyword")
+    col1, col2 = st.columns([3, 1])
+    if col1.button("搜索", key="search_btn"):
+        results = search_stocks(keyword)
+        if results:
+            st.session_state.results = results
         else:
-            code = st.text_input("代码")
-            name = st.text_input("名称")
+            st.warning("未找到")
+    
+    if "results" in st.session_state and st.session_state.results:
+        opts = [f"{c} - {n}" for c, n in st.session_state.results]
+        sel = st.selectbox("选择股票", opts, key="select_stock")
+        code = sel.split(" - ")[0]
+        name = sel.split(" - ")[1]
+    else:
+        code = st.text_input("代码", key="manual_code")
+        name = st.text_input("名称", key="manual_name")
+    
+    with st.form("add_trade"):
         action = st.selectbox("操作", ["买入", "卖出"])
         shares = st.number_input("数量", min_value=1, step=100)
         price = st.number_input("价格", min_value=0.01, format="%.3f")
@@ -201,7 +199,11 @@ def manual_add_transaction(data):
         td = st.date_input("日期", value=date.today())
         if st.form_submit_button("保存"):
             if code and name:
-                data["transactions"].append({"code": code, "name": name, "action": action, "shares": shares, "price": price, "fee": fee, "date": td.isoformat(), "timestamp": datetime.now().isoformat()})
+                data["transactions"].append({
+                    "code": code, "name": name, "action": action,
+                    "shares": shares, "price": price, "fee": fee,
+                    "date": td.isoformat(), "timestamp": datetime.now().isoformat()
+                })
                 save_data(data)
                 st.success("已保存")
                 st.rerun()
@@ -209,20 +211,15 @@ def manual_add_transaction(data):
 def screenshot_add_transaction(data):
     st.subheader("截图批量导入")
     st.info("上传券商成交截图（支持png/jpg），系统将自动识别交易信息。识别结果请人工核对后导入。")
-
     uploaded_files = st.file_uploader("选择截图（可多选）", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-
     if not uploaded_files:
         st.stop()
-
     if st.button("🔍 开始识别"):
-        # 动态导入OCR，避免启动时报错
         try:
             from ocr_parser import extract_text_from_image, parse_stock_screenshot
         except ImportError:
             st.error("OCR 解析模块未正确安装，请检查依赖。")
             st.stop()
-
         all_records = []
         progress_bar = st.progress(0, text="正在识别...")
         for i, uploaded_file in enumerate(uploaded_files):
@@ -238,12 +235,9 @@ def screenshot_add_transaction(data):
                 all_records.append(parsed)
             except Exception as e:
                 st.error(f"第 {i+1} 张图片处理出错: {e}")
-
         if not all_records:
             st.warning("没有成功识别出任何交易记录。")
             st.stop()
-
-        # 显示识别结果供核对
         st.success(f"共识别出 {len(all_records)} 条可能的交易记录，请核对：")
         edited_records = []
         for idx, rec in enumerate(all_records):
@@ -257,7 +251,6 @@ def screenshot_add_transaction(data):
                     qty = st.text_input(f"数量 {idx+1}", value=rec.get("quantity",""), key=f"qty_{idx}")
                     prc = st.text_input(f"价格 {idx+1}", value=rec.get("price",""), key=f"prc_{idx}")
                 edited_records.append({"code": code, "name": name, "action": action, "shares": qty, "price": prc})
-
         if st.button("🚀 确认批量导入"):
             success_count = 0
             for rec in edited_records:
@@ -271,14 +264,9 @@ def screenshot_add_transaction(data):
                         st.warning(f"跳过无效记录: {rec}")
                         continue
                     data["transactions"].append({
-                        "code": code,
-                        "name": name,
-                        "action": action,
-                        "shares": shares,
-                        "price": price,
-                        "fee": 0.0,
-                        "date": date.today().isoformat(),
-                        "timestamp": datetime.now().isoformat()
+                        "code": code, "name": name, "action": action,
+                        "shares": shares, "price": price, "fee": 0.0,
+                        "date": date.today().isoformat(), "timestamp": datetime.now().isoformat()
                     })
                     success_count += 1
                 except Exception as e:
@@ -287,7 +275,6 @@ def screenshot_add_transaction(data):
             st.success(f"成功导入 {success_count} 条交易记录！")
             st.rerun()
 
-# ---------- 交易明细 ----------
 def show_transactions(data):
     st.subheader("交易明细")
     if not data["transactions"]:
@@ -302,7 +289,6 @@ def show_transactions(data):
         df.columns = ["日期", "代码", "名称", "操作", "数量", "价格", "手续费"]
         st.dataframe(df, width='stretch', hide_index=True)
 
-# ---------- 分红记录 ----------
 def manage_dividends(data):
     st.subheader("分红记录")
     st.info("分红功能：输入股票代码和金额，自动扣减持仓成本")
@@ -321,7 +307,6 @@ def manage_dividends(data):
         df = pd.DataFrame(data["dividends"])
         st.dataframe(df, width='stretch', hide_index=True)
 
-# ---------- 导出数据 ----------
 def export_data(data):
     st.subheader("导出数据")
     if st.button("导出为JSON"):
@@ -344,4 +329,3 @@ def export_data(data):
 
 if __name__ == "__main__":
     main()
-
