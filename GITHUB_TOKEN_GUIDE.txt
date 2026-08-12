@@ -1,0 +1,15 @@
+=== GitHub Token 创建指引 ===
+
+1. 手机浏览器打开: https://github.com/settings/tokens
+2. 点 "Generate new token" → "Generate new token (classic)"
+3. Note 填: stock-deploy
+4. Expiration 选: No expiration
+5. 权限只勾选: repo (全部子项自动勾选)
+6. 拉到底点: Generate token
+7. 立即复制 ghp_xxxx 这串字符（只显示一次！）
+
+=== Streamlit Cloud Secrets 格式 ===
+
+REPO_OWNER = "你的GitHub用户名"
+REPO_NAME = "stock-tracker"
+GITHUB_TOKEN = "ghp_刚才复制的那串"
