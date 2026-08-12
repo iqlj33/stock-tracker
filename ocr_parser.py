@@ -1,407 +1,287 @@
-# -*- coding: utf-8 -*-
 """
-OCR 解析引擎 - 从券商截图文本中提取结构化交易记录
-支持多种券商APP截图格式
+ocr_parser.py — 轻量截图解析模块
+依赖: rapidocr-onnxruntime (纯ONNX, ~10MB, 无PyTorch/TensorFlow)
+功能: 解析券商成交截图，提取股票代码/名称/买卖方向/数量/价格/日期
 """
 
 import re
-from datetime import datetime, date
+import base64
+import io
+from typing import List, Dict, Optional, Tuple
+
+# ============ 常量 ============
+BUY_KEYWORDS = ["买入", "买", "B", "BUY", "买进", "增持"]
+SELL_KEYWORDS = ["卖出", "卖", "S", "SELL", "卖出", "减持"]
+DATE_PATTERN = re.compile(r'(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?)')
+CODE_PATTERN = re.compile(r'\b(\d{6})\b')
+PRICE_PATTERN = re.compile(r'(?:成交价|价格|委托价|成交均价)[：: ]*(\d+\.\d{2,3})')
+SHARES_PATTERN = re.compile(r'(?:数量|股数|成交数量|委托数量)[：: ]*(\d{1,6})')
+FEE_PATTERN = re.compile(r'(?:手续费|佣金|费用)[：: ]*(\d+\.\d{2})')
 
 
-# ==================== 工具函数 ====================
+def _get_ocr_engine():
+    """懒加载OCR引擎，避免import时就下载模型"""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        return RapidOCR()
+    except ImportError:
+        return None
 
-def extract_stock_code(text):
-    """从文本中提取6位股票代码"""
-    # 匹配 6位数字，前后可能有括号、空格
-    patterns = [
-        r'[（(]\s*(\d{6})\s*[）)]',   # (600519) 或 （600519）
-        r'(\d{6})\s*[）)]',             # 600519）
-        r'[（(]\s*(\d{6})',             # (600519
-        r'(?<![/\d])(\d{6})(?![/\d])', # 独立的6位数字
-    ]
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            code = m.group(1)
-            # 验证是合法A股代码
-            if code.startswith(("0", "3", "6", "688", "8")):
-                return code
+
+def _extract_text_from_image(image_bytes: bytes) -> str:
+    """用OCR从图片中提取所有文字"""
+    engine = _get_ocr_engine()
+    if engine is None:
+        # 降级：如果没有OCR引擎，尝试用Pillow打开后返回空（触发手动模式）
+        return ""
+    try:
+        # RapidOCR 接受 numpy array 或 bytes
+        import numpy as np
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        img_array = np.array(img)
+        result, _ = engine(img_array)
+        if not result:
+            return ""
+        # result 是 list of (box, text, confidence)
+        texts = [item[1] for item in result if len(item) >= 2]
+        return "\n".join(texts)
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return ""
+
+
+def _parse_action(text: str) -> Optional[str]:
+    """从文本中识别买卖方向"""
+    for kw in BUY_KEYWORDS:
+        if kw in text:
+            return "买入"
+    for kw in SELL_KEYWORDS:
+        if kw in text:
+            return "卖出"
+    # 尝试从上下文判断
+    if "买" in text:
+        return "买入"
+    if "卖" in text:
+        return "卖出"
     return None
 
 
-def extract_stock_name(text, exclude_words=None):
-    """从文本中提取中文股票名称"""
-    if exclude_words is None:
-        exclude_words = set()
+def _parse_stock_code_and_name(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """提取股票代码和名称"""
+    code = None
+    name = None
 
-    # 常见的非股票名称关键词
-    stop_words = {
-        "成交明细", "委托成交", "历史成交", "当日成交", "交易记录",
-        "买入", "卖出", "买", "卖", "交易", "委托", "成交",
-        "价格", "数量", "金额", "手续费", "印花税", "过户费",
-        "日期", "时间", "状态", "已成交", "未成交", "撤单",
-        "持仓", "可用", "冻结", "成本", "现价", "盈亏",
-        "合计", "总计", "小计", "确认", "取消", "提交",
-        "详情", "更多", "返回", "刷新", "搜索", "筛选",
-        "全部", "股票", "代码", "名称", "序号",
-    }
-    stop_words.update(exclude_words)
+    # 方法1: 直接匹配6位数字代码
+    matches = CODE_PATTERN.findall(text)
+    if matches:
+        code = matches[0]
 
-    # 匹配2-4个连续中文字符
-    chinese_pattern = re.compile(r'[\u4e00-\u9fa5]{2,5}')
-    matches = chinese_pattern.findall(text)
+    # 方法2: 从 "名称(代码)" 或 "代码 名称" 格式提取
+    pattern2 = re.compile(r'([\u4e00-\u9fa5]{2,5})\s*[\(（]\s*(\d{6})\s*[\)）]')
+    m2 = pattern2.search(text)
+    if m2:
+        name = m2.group(1)
+        code = m2.group(2)
 
-    for m in matches:
-        if m not in stop_words and len(m) >= 2:
-            # 排除包含数字或符号的
-            if not re.search(r'[0-9()（）/]', m):
-                return m
-    return ""
+    # 方法3: 代码在前
+    pattern3 = re.compile(r'(\d{6})\s+([\u4e00-\u9fa5]{2,5})')
+    m3 = pattern3.search(text)
+    if m3:
+        code = m3.group(1)
+        name = m3.group(2)
+
+    # 尝试从文本行中提取名称（紧跟代码的汉字）
+    if code and not name:
+        lines = text.split("\n")
+        for line in lines:
+            if code in line:
+                # 从同一行提取中文名称
+                chinese_chars = re.findall(r'[\u4e00-\u9fa5]{2,5}', line)
+                # 过滤掉"成交明细""委托""买卖"等关键词
+                skip_words = {"成交明细", "委托", "成交", "申报", "确认", "买入", "卖出",
+                              "名称", "代码", "价格", "数量", "金额", "手续费", "佣金",
+                              "日期", "时间", "合计", "摘要", "备注", "状态", "方向"}
+                for word in chinese_chars:
+                    if word not in skip_words and len(word) >= 2:
+                        name = word
+                        break
+                break
+
+    return code, name
 
 
-def extract_price(text):
-    """从文本中提取价格（通常是小数点后2-3位的数字）"""
-    # 价格通常在 0.01 ~ 9999.99 之间
+def _parse_price(text: str) -> Optional[float]:
+    """提取成交价格"""
+    # 优先匹配 "成交价: XX.XX"
+    m = PRICE_PATTERN.search(text)
+    if m:
+        return float(m.group(1))
+
+    # 退而求其次: 找所有价格格式的数字，选最可能的
+    prices = re.findall(r'(\d{1,3}\.\d{2,3})', text)
+    if prices:
+        # 过滤掉明显不是股价的（如百分比、日期等）
+        valid = [float(p) for p in prices if 0.5 <= float(p) <= 5000]
+        if valid:
+            return valid[0]
+    return None
+
+
+def _parse_shares(text: str) -> Optional[int]:
+    """提取成交数量"""
+    m = SHARES_PATTERN.search(text)
+    if m:
+        return int(m.group(1))
+
+    # 尝试从文本中找数量
+    # 常见格式: "数量 100" 或 "100股"
     patterns = [
-        r'价格[：:]\s*(\d+\.\d{2,3})',
-        r'成交价[：:]\s*(\d+\.\d{2,3})',
-        r'@\s*(\d+\.\d{2,3})',
-        r'(\d{1,4}\.\d{2,3})',
+        re.compile(r'(\d{2,6})\s*股'),
+        re.compile(r'股数[：: ]*(\d{2,6})'),
     ]
     for p in patterns:
-        m = re.search(p, text)
+        m = p.search(text)
         if m:
-            val = float(m.group(1))
-            if 0.01 <= val <= 99999:
-                return val
+            return int(m.group(1))
+    return None
+
+
+def _parse_date(text: str) -> Optional[str]:
+    """提取交易日期，返回 ISO 格式"""
+    m = DATE_PATTERN.search(text)
+    if m:
+        raw = m.group(1)
+        # 统一格式
+        raw = raw.replace("年", "-").replace("月", "-").replace("日", "")
+        raw = raw.replace("/", "-")
+        parts = raw.split("-")
+        if len(parts) == 3:
+            return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+    return None
+
+
+def _parse_fee(text: str) -> float:
+    """提取手续费"""
+    m = FEE_PATTERN.search(text)
+    if m:
+        return float(m.group(1))
     return 0.0
 
 
-def extract_quantity(text):
-    """从文本中提取数量（股数，通常是100的整数倍）"""
-    patterns = [
-        r'数量[：:]\s*(\d+)',
-        r'股数[：:]\s*(\d+)',
-        r'(\d+)\s*股',
-        r'(\d{3,7})',
-    ]
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            val = int(m.group(1))
-            if 100 <= val <= 10000000:
-                return val
-    return 0
-
-
-def extract_date(text):
-    """从文本中提取日期，返回 YYYY-MM-DD 格式"""
-    patterns = [
-        (r'(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日]?', "%Y-%m-%d"),
-        (r'(\d{4})(\d{2})(\d{2})', "%Y-%m-%d"),
-    ]
-    for p, fmt in patterns:
-        m = re.search(p, text)
-        if m:
-            try:
-                if len(m.groups()) == 3:
-                    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                    return f"{y:04d}-{mo:02d}-{d:02d}"
-            except:
-                pass
-    return date.today().isoformat()
-
-
-def detect_action(text):
-    """检测交易方向"""
-    if re.search(r'卖出|卖\b|SELL|Sell', text, re.IGNORECASE):
-        return "卖出"
-    elif re.search(r'买入|买\b|BUY|Buy', text, re.IGNORECASE):
-        return "买入"
-    return None
-
-
-# ==================== 主解析函数 ====================
-
-def parse_trade_from_text(lines, stock_code_hint=""):
+def parse_screenshot(image_bytes: bytes) -> Dict:
     """
-    从 OCR 文本行列表中解析交易记录
-
-    策略（状态机）：
-    1. 全局预扫：建立 code <-> name 映射
-    2. 逐行扫描，维护一个 current_trade 草稿
-    3. 遇到新股票代码/新动作 -> 完成上一笔，开启新一笔
-    4. 每行提取能提取的字段，填充到当前草稿
-
-    返回：交易记录列表
+    解析一张成交截图，返回结构化结果
+    返回格式:
+    {
+        "success": bool,
+        "code": "600519" | None,
+        "name": "贵州茅台" | None,
+        "action": "买入" | "卖出" | None,
+        "shares": 100 | None,
+        "price": 1680.50 | None,
+        "fee": 5.0,
+        "date": "2026-01-15" | None,
+        "raw_text": "OCR提取的原始文本",
+        "confidence": 0.85  # 解析置信度 0-1
+    }
     """
-    trades = []
+    raw_text = _extract_text_from_image(image_bytes)
 
-    # ---- 全局预扫：code <-> name ----
-    code_name_map = {}
-    name_code_map = {}
-    for line in lines:
-        code = extract_stock_code(line)
-        if code:
-            name = extract_stock_name(line)
-            if code not in code_name_map:
-                code_name_map[code] = name
-            if name and name not in name_code_map:
-                name_code_map[name] = code
+    if not raw_text:
+        return {
+            "success": False,
+            "code": None, "name": None, "action": None,
+            "shares": None, "price": None, "fee": 0.0,
+            "date": None, "raw_text": "", "confidence": 0.0,
+            "error": "OCR识别失败，请检查图片清晰度或手动录入"
+        }
 
-    def flush(trade, lst):
-        """将草稿判定是否合格，合格则加入列表"""
-        if not trade:
-            return
-        score = 0
-        if trade.get("code"): score += 1
-        if trade.get("name"): score += 1
-        if trade.get("price", 0) > 0: score += 1
-        if trade.get("shares", 0) >= 100: score += 1
-        if trade.get("action") in ("买入", "卖出"): score += 1
+    code, name = _parse_stock_code_and_name(raw_text)
+    action = _parse_action(raw_text)
+    shares = _parse_shares(raw_text)
+    price = _parse_price(raw_text)
+    fee = _parse_fee(raw_text)
+    date_str = _parse_date(raw_text)
 
-        if score >= 3:  # 至少代码+价格+数量 或 名称+价格+数量
-            if score >= 4:
-                trade["confidence"] = "high"
-            elif score >= 3:
-                trade["confidence"] = "medium"
-            else:
-                trade["confidence"] = "low"
-            lst.append(trade)
+    # 计算置信度
+    fields_found = sum(1 for v in [code, name, action, shares, price] if v is not None)
+    confidence = fields_found / 5.0
 
-    current = None
-    last_code = None   # 最近见过的代码（用于跨行补全）
-    last_name = None
-    last_date = None   # 最近见过的日期
+    success = all([code, action, shares, price])
 
-    for line in lines:
-        line_stripped = line.strip()
-        if not line_stripped:
-            continue
-
-        # 跳过纯装饰行
-        if re.match(r'^[=~\-_\s]+$', line_stripped):
-            continue
-
-        # 跳过表头行（含关键词且无股票代码）
-        header_kws = ["成交明细", "委托成交", "历史成交", "交易记录", "序号", "合计", "总计"]
-        if any(kw in line_stripped for kw in header_kws):
-            if not re.search(r'\d{6}', line_stripped):
-                continue
-
-        # 本行能提取的字段
-        code = extract_stock_code(line_stripped)
-        name = extract_stock_name(line_stripped)
-        action = detect_action(line_stripped)
-        price = extract_price(line_stripped)
-        qty = extract_quantity(line_stripped)
-        dt = extract_date(line_stripped)
-
-        # 更新全局最近值
-        if code: last_code = code
-        if name: last_name = name
-        if dt != date.today().isoformat():  # 如果不是默认值
-            last_date = dt
-
-        # 判断是否开启新交易
-        is_new = False
-        if code and code != (current.get("code") if current else None):
-            is_new = True
-        elif action and current is None:
-            is_new = True
-        elif price > 0 and qty >= 100 and current is None:
-            is_new = True
-
-        if is_new:
-            # 先把旧的 flush
-            if current:
-                flush(current, trades)
-            # 开新
-            current = {
-                "code": code or last_code or stock_code_hint,
-                "name": name or (code_name_map.get(code, "") if code else "") or last_name or "",
-                "action": action or "买入",
-                "shares": qty,
-                "price": price,
-                "fee": 0.0,
-                "date": dt if dt != date.today().isoformat() else (last_date or dt),
-                "note": "OCR导入",
-                "confidence": "low"
-            }
-        else:
-            # 填充到当前草稿
-            if current is None:
-                current = {
-                    "code": code or last_code or stock_code_hint,
-                    "name": name or last_name or "",
-                    "action": action or "买入",
-                    "shares": qty,
-                    "price": price,
-                    "fee": 0.0,
-                    "date": dt if dt != date.today().isoformat() else (last_date or dt),
-                    "note": "OCR导入",
-                    "confidence": "low"
-                }
-            if code: current["code"] = code
-            if name: current["name"] = name
-            if action: current["action"] = action
-            if price > 0: current["price"] = price
-            if qty >= 100: current["shares"] = qty
-            if dt != date.today().isoformat(): current["date"] = dt
-
-        # 如果当前草稿已"完整"，flush 并重置（为下一条做准备）
-        if current and current.get("price", 0) > 0 and current.get("shares", 0) >= 100:
-            flush(current, trades)
-            current = None
-
-    # 最后一条
-    if current:
-        flush(current, trades)
-
-    # 去重
-    seen = set()
-    unique = []
-    for t in trades:
-        key = (t["code"], t["price"], t["shares"], t["action"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(t)
-
-    return unique
+    return {
+        "success": success,
+        "code": code,
+        "name": name,
+        "action": action,
+        "shares": shares,
+        "price": price,
+        "fee": fee,
+        "date": date_str,
+        "raw_text": raw_text,
+        "confidence": confidence,
+        "error": None if success else f"部分字段缺失 (置信度 {confidence:.0%})"
+    }
 
 
-def parse_trade_table(lines):
+def parse_multiple_screenshots(image_list: List[bytes]) -> List[Dict]:
+    """批量解析多张截图"""
+    results = []
+    for img_bytes in image_list:
+        result = parse_screenshot(img_bytes)
+        results.append(result)
+    return results
+
+
+def validate_transaction(parsed: Dict, existing_shares: int = 0) -> Tuple[bool, str]:
     """
-    解析表格形式的截图（如券商的历史成交列表）
-    每行包含：代码 名称 日期 价格 数量 金额
+    校验解析结果是否合理
+    返回: (是否通过, 提示信息)
     """
-    trades = []
+    if not parsed.get("code"):
+        return False, "缺少股票代码"
+    if not parsed.get("action"):
+        return False, "无法识别买卖方向"
+    if not parsed.get("shares") or parsed["shares"] <= 0:
+        return False, "数量无效"
+    if not parsed.get("price") or parsed["price"] <= 0:
+        return False, "价格无效"
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    # 卖出时检查持仓
+    if parsed["action"] == "卖出" and parsed["shares"] > existing_shares:
+        return False, f"卖出数量({parsed['shares']})超过持仓({existing_shares})"
 
-        # 必须有6位数字代码
-        code_m = re.search(r'\d{6}', line)
-        if not code_m:
-            continue
-
-        code = code_m.group()
-
-        # 提取名称（代码前面的中文）
-        name_m = re.search(r'([\u4e00-\u9fa5]{2,4})\s*' + re.escape(code), line)
-        name = name_m.group(1) if name_m else ""
-
-        # 判断买卖
-        if re.search(r'卖出|SELL', line, re.IGNORECASE):
-            action = "卖出"
-        elif re.search(r'买入|BUY', line, re.IGNORECASE):
-            action = "买入"
-        else:
-            action = "买入"  # 默认
-
-        # 提取所有数字
-        numbers = re.findall(r'\d+\.?\d*', line)
-        numbers = [float(n) for n in numbers if n.replace('.', '').isdigit()]
-
-        price = 0.0
-        shares = 0
-        for n in numbers:
-            if 0.01 <= n <= 99999 and price == 0:
-                price = n
-            elif 100 <= n <= 10000000 and shares == 0 and n == int(n):
-                shares = int(n)
-
-        if price > 0 or shares > 0:
-            trades.append({
-                "code": code,
-                "name": name,
-                "action": action,
-                "shares": shares,
-                "price": price,
-                "fee": 0.0,
-                "date": date.today().isoformat(),
-                "note": "OCR表格导入",
-                "confidence": "medium" if price > 0 and shares > 0 else "low"
-            })
-
-    return trades
+    return True, "校验通过"
 
 
-def parse_multi_stock_screenshot(lines):
+# ============ 测试用 ============
+if __name__ == "__main__":
+    # 简单的自检
+    test_text = """
+    成交明细
+    贵州茅台(600519)
+    买入 100股
+    成交价: 1680.500
+    数量: 100
+    手续费: 5.00
+    日期: 2026-01-15
     """
-    高级解析：针对一整屏多只股票的持仓/成交截图
-    自动识别每只股票的区块并分别解析
-    """
-    # 先按空行分割成多个区块
-    blocks = []
-    current = []
-    for line in lines:
-        if line.strip():
-            current.append(line.strip())
-        else:
-            if current:
-                blocks.append(current)
-                current = []
-    if current:
-        blocks.append(current)
+    code, name = _parse_stock_code_and_name(test_text)
+    action = _parse_action(test_text)
+    shares = _parse_shares(test_text)
+    price = _parse_price(test_text)
+    date_str = _parse_date(test_text)
 
-    all_trades = []
-    for block in blocks:
-        block_text = "\n".join(block)
-        trades = parse_trade_from_text(block)
-        all_trades.extend(trades)
-
-    return all_trades
-
-
-# ==================== 辅助：生成测试图片 ====================
-
-def create_test_screenshot():
-    """生成一张模拟的券商成交截图（用于测试OCR）"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        import os
-
-        img = Image.new('RGB', (800, 600), color='white')
-        draw = ImageDraw.Draw(img)
-
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 20)
-            font_large = ImageFont.truetype("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 24)
-        except:
-            font = ImageFont.load_default()
-            font_large = font
-
-        # 标题
-        draw.text((300, 20), "成交明细", fill='black', font=font_large)
-
-        # 表头
-        y = 80
-        headers = ["代码", "名称", "操作", "价格", "数量"]
-        x_positions = [50, 150, 300, 400, 550]
-        for h, x in zip(headers, x_positions):
-            draw.text((x, y), h, fill='gray', font=font)
-
-        # 数据行
-        rows = [
-            ("600519", "贵州茅台", "买入", "1685.50", "100"),
-            ("002594", "比亚迪", "买入", "198.30", "200"),
-            ("300750", "宁德时代", "卖出", "215.80", "100"),
-        ]
-
-        y = 120
-        for code, name, action, price, qty in rows:
-            draw.text((50, y), code, fill='black', font=font)
-            draw.text((150, y), name, fill='black', font=font)
-            draw.text((300, y), action, fill='red' if action == "买入" else 'green', font=font)
-            draw.text((400, y), price, fill='black', font=font)
-            draw.text((550, y), qty, fill='black', font=font)
-            y += 50
-
-        output_path = "/data/workspace/stock_tracker/test_screenshot.png"
-        img.save(output_path)
-        return output_path
-    except ImportError:
-        return None
+    print(f"代码: {code}")
+    print(f"名称: {name}")
+    print(f"方向: {action}")
+    print(f"数量: {shares}")
+    print(f"价格: {price}")
+    print(f"日期: {date_str}")
+    assert code == "600519"
+    assert name == "贵州茅台"
+    assert action == "买入"
+    assert shares == 100
+    assert price == 1680.50
+    print("\n✅ 所有测试通过!")
