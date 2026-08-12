@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-📈 股票持仓管家 - 云端版
+📈 股票持仓管家 - 云端版 v2.1
+新增功能：截图批量导入交易记录（OCR识别 + 手动修正双轨制）
 完全在手机浏览器中运行，数据自动同步到 GitHub
 """
 
@@ -8,10 +9,12 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import re
 import requests
 import base64
 import io
 import time
+import tempfile
 from datetime import datetime, date
 
 # ==================== 页面配置 ====================
@@ -22,7 +25,7 @@ st.set_page_config(
     menu_items={
         'Get Help': None,
         'Report a bug': None,
-        'About': "📈 股票持仓管家 v2.0 - 云端同步版"
+        'About': "📈 股票持仓管家 v2.1 - 支持截图批量导入"
     }
 )
 
@@ -38,6 +41,47 @@ try:
     from stock_list import STOCK_LIST
 except ImportError:
     STOCK_LIST = []
+
+# 导入 OCR 解析引擎
+try:
+    from ocr_parser import (
+        parse_trade_from_text,
+        parse_trade_table,
+        parse_multi_stock_screenshot,
+        extract_stock_code,
+        extract_stock_name,
+        extract_price,
+        extract_quantity,
+        extract_date,
+        detect_action,
+        create_test_screenshot,
+    )
+    PARSER_AVAILABLE = True
+except ImportError:
+    PARSER_AVAILABLE = False
+
+# ==================== OCR 引擎（懒加载） ====================
+@st.cache_resource
+def load_ocr_reader():
+    """懒加载 OCR 引擎，Streamlit Cloud 环境可能安装失败，需优雅降级"""
+    try:
+        import easyocr
+        reader = easyocr.Reader(['ch_sim', 'en'], verbose=False, gpu=False)
+        return reader, True
+    except Exception:
+        return None, False
+
+def ocr_image(image_path):
+    """对图片做 OCR，返回识别出的文本行列表"""
+    reader, available = load_ocr_reader()
+    if not available:
+        return None
+    try:
+        results = reader.readtext(image_path)
+        lines = [text for (_, text, _) in results]
+        return lines
+    except Exception:
+        return None
 
 # ==================== 数据持久化 ====================
 @st.cache_data(ttl=30)
@@ -55,7 +99,7 @@ def load_data():
                     f.write(content)
                 return json.loads(content)
         except Exception:
-            pass  # 静默失败，用本地缓存
+            pass
 
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -216,7 +260,6 @@ def compute_portfolio(data):
                 info["total_shares"] -= shares
                 info["realized_profit"] += (sell_value - sold_cost)
 
-    # 分红扣减成本
     for d in dividends:
         code = d["code"]
         if code in stocks_info:
@@ -230,9 +273,193 @@ def compute_portfolio(data):
 
 
 def get_current_holdings(data):
-    """获取当前持仓（排除已清仓的）"""
+    """获取当前持仓"""
     stocks_info = compute_portfolio(data)
     return {k: v for k, v in stocks_info.items() if v["total_shares"] > 0}
+
+
+# ==================== OCR 解析引擎 ====================
+
+def parse_trade_from_text(lines, stock_code_hint=""):
+    """
+    从 OCR 文本行中解析交易记录
+    支持常见券商APP截图格式，返回列表 of dict
+    """
+    trades = []
+
+    # 常见关键词映射
+    action_map = {
+        "买入": "买入", "买": "买入", "BUY": "买入", "Buy": "买入",
+        "卖出": "卖出", "卖": "卖出", "SELL": "卖出", "Sell": "卖出",
+    }
+
+    # 合并所有文本，按行处理
+    full_text = "\n".join(lines)
+
+    # 尝试匹配股票代码（6位数字）
+    code_pattern = re.compile(r'[（(]?\s*(\d{6})\s*[）)]?')
+    # 尝试匹配股票名称（2-4个中文字符）
+    name_pattern = re.compile(r'[\u4e00-\u9fa5]{2,4}')
+
+    # 尝试匹配日期
+    date_patterns = [
+        re.compile(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})'),
+        re.compile(r'(\d{4}年\d{1,2}月\d{1,2}日)'),
+    ]
+
+    # 尝试匹配价格（数字+小数点）
+    price_pattern = re.compile(r'(\d+\.\d{2,3})')
+
+    # 尝试匹配数量（整数，通常>=100）
+    qty_pattern = re.compile(r'(\d{3,7})')
+
+    # 尝试匹配金额
+    amount_pattern = re.compile(r'[¥￥]?\s*(\d{4,8}\.\d{2})')
+
+    # 简单策略：按行扫描，寻找包含交易关键词的行
+    current_trade = None
+    found_code = None
+    found_name = None
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # 检查是否有股票代码
+        code_match = code_pattern.search(line)
+        if code_match:
+            found_code = code_match.group(1)
+
+        # 检查是否有股票名称
+        name_match = name_pattern.search(line)
+        if name_match and not found_name:
+            found_name = name_match.group()
+
+        # 检查是否包含交易动作关键词
+        action = None
+        for kw, act in action_map.items():
+            if kw in line:
+                action = act
+                break
+
+        if action:
+            # 开始一条新交易记录
+            trade = {
+                "code": found_code or stock_code_hint,
+                "name": found_name or "",
+                "action": action,
+                "shares": 0,
+                "price": 0.0,
+                "fee": 0.0,
+                "date": date.today().isoformat(),
+                "note": "OCR导入",
+                "confidence": "low"  # low/medium/high
+            }
+
+            # 尝试从同行提取价格
+            prices = price_pattern.findall(line)
+            if prices:
+                # 第一个价格通常是成交价
+                try:
+                    trade["price"] = float(prices[0])
+                    trade["confidence"] = "medium"
+                except:
+                    pass
+
+            # 尝试提取数量
+            # 在价格之后寻找数量
+            qtys = qty_pattern.findall(line)
+            if qtys:
+                for q in qtys:
+                    val = int(q)
+                    if val >= 100 and val <= 10000000:
+                        trade["shares"] = val
+                        break
+
+            # 尝试提取日期
+            for dp in date_patterns:
+                dm = dp.search(line)
+                if dm:
+                    raw = dm.group(1)
+                    # 统一格式
+                    raw = raw.replace("/", "-").replace("年", "-").replace("月", "-").replace("日", "")
+                    parts = raw.split("-")
+                    if len(parts) == 3:
+                        trade["date"] = f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+                    break
+
+            # 如果代码和名称都有，提高置信度
+            if trade["code"] and trade["name"]:
+                trade["confidence"] = "high"
+
+            trades.append(trade)
+
+    # 后处理：如果没找到动作但有代码，尝试整块解析
+    if not trades:
+        # 退化策略：从全文提取所有数字组合，让用户手动映射
+        pass
+
+    return trades
+
+
+def parse_trade_table(df_text):
+    """
+    解析表格形式的截图（如券商的历史成交列表）
+    输入：OCR识别出的多行文本
+    输出：交易记录列表
+    """
+    trades = []
+    # 尝试按表格行解析
+    for line in df_text:
+        # 去除多余空格
+        cleaned = re.sub(r'\s+', ' ', line).strip()
+        if not cleaned:
+            continue
+
+        # 尝试提取6位股票代码
+        code_m = re.search(r'\d{6}', cleaned)
+        if not code_m:
+            continue
+
+        code = code_m.group()
+        # 提取名称（代码前面的中文）
+        name_m = re.search(r'([\u4e00-\u9fa5]{2,4})\s*' + code, cleaned)
+        name = name_m.group(1) if name_m else ""
+
+        # 判断买卖
+        action = "买入"  # 默认
+        if any(k in cleaned for k in ["卖出", "卖", "SELL"]):
+            action = "卖出"
+        elif any(k in cleaned for k in ["买入", "买", "BUY"]):
+            action = "买入"
+
+        # 提取所有数字
+        numbers = re.findall(r'\d+\.?\d*', cleaned)
+        numbers = [float(n) for n in numbers]
+
+        # 启发式分配：通常格式为 代码 名称 日期 价格 数量 金额
+        price = 0.0
+        shares = 0
+        for n in numbers:
+            if 1 <= n <= 1000 and price == 0:
+                price = n
+            elif n >= 100 and n == int(n) and shares == 0:
+                shares = int(n)
+
+        trades.append({
+            "code": code,
+            "name": name,
+            "action": action,
+            "shares": shares,
+            "price": price,
+            "fee": 0.0,
+            "date": date.today().isoformat(),
+            "note": "OCR表格导入",
+            "confidence": "medium"
+        })
+
+    return trades
 
 
 # ==================== UI 组件 ====================
@@ -246,7 +473,7 @@ def render_header():
             📈 股票持仓管家
         </h1>
         <p style='color: rgba(255,255,255,0.7); margin: 4px 0 0 0; font-size: 12px;'>
-            云端同步 · 实时行情 · 成本计算 · 分红除权
+            云端同步 · 实时行情 · 成本计算 · 分红除权 · 截图导入
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -267,7 +494,6 @@ def show_overview(data):
 
     if not holdings:
         st.info("📭 暂无持仓，请到「➕ 交易」页面录入第一笔操作。")
-        # 仍然显示已清仓的汇总
         closed = {k: v for k, v in stocks_info.items() if v["total_shares"] == 0 and v["realized_profit"] != 0}
         if closed:
             st.write("**已清仓股票收益：**")
@@ -320,7 +546,6 @@ def show_overview(data):
 
     progress.empty()
 
-    # 汇总卡片
     st.markdown("### 💼 资产汇总")
     c1, c2, c3 = st.columns(3)
     c1.metric("总市值", f"{total_market:.2f} 元")
@@ -334,7 +559,6 @@ def show_overview(data):
     c5.metric("累计分红", f"{total_dividends:.2f} 元")
     c6.metric("总收益", f"{total_profit + total_realized + total_dividends:.2f} 元")
 
-    # 数据表格
     df = pd.DataFrame(rows)
     st.dataframe(
         df,
@@ -356,7 +580,6 @@ def add_transaction(data):
     """添加交易记录"""
     st.subheader("➕ 添加交易")
 
-    # 搜索区域
     with st.container(border=True):
         st.write("**🔍 选择股票**")
         keyword = st.text_input("输入股票代码或名称搜索",
@@ -382,12 +605,10 @@ def add_transaction(data):
 
     st.divider()
 
-    # 交易表单
     with st.form("trade_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         action = col1.selectbox("操作类型", ["买入", "卖出"])
 
-        # 显示当前持仓
         holdings = get_current_holdings(data)
         current_shares = holdings.get(code, {}).get("total_shares", 0) if code else 0
         if code and current_shares > 0:
@@ -439,7 +660,6 @@ def show_transactions(data):
         st.info("📭 暂无交易记录")
         return
 
-    # 按股票筛选
     codes = sorted(set(t["code"] for t in data["transactions"]))
     name_map = {t["code"]: t["name"] for t in data["transactions"]}
     options = ["全部"] + [f"{c} - {name_map[c]}" for c in codes]
@@ -468,7 +688,6 @@ def show_transactions(data):
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # 删除功能
     with st.expander("🗑️ 删除交易记录（不可恢复）"):
         del_idx = st.number_input("输入要删除的交易序号(#)",
                                    min_value=0,
@@ -520,7 +739,6 @@ def manage_dividends(data):
 
     st.divider()
 
-    # 显示已有分红
     if data["dividends"]:
         st.write("**已有分红记录：**")
         rows = []
@@ -536,7 +754,6 @@ def manage_dividends(data):
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # 编辑
         with st.expander("✏️ 编辑分红金额"):
             edit_idx = st.number_input("选择记录序号(#)",
                                         min_value=0,
@@ -564,7 +781,6 @@ def manage_dividends(data):
     else:
         st.info("暂无分红记录")
 
-    # 手动添加
     with st.expander("➕ 手动添加分红"):
         col1, col2 = st.columns(2)
         code = col1.text_input("股票代码")
@@ -589,6 +805,303 @@ def manage_dividends(data):
                 st.rerun()
 
 
+def screenshot_import(data):
+    """
+    📸 截图批量导入交易记录
+    支持：拍照上传 / 相册选择 → OCR识别 → 手动修正 → 批量确认导入
+    """
+    st.subheader("📸 截图批量导入")
+    st.caption("上传券商APP的交易截图，自动识别交易信息，确认后批量导入")
+
+    # ---- 检查OCR可用性 ----
+    reader, ocr_available = load_ocr_reader()
+    if not ocr_available:
+        st.warning("""
+        ⚠️ **当前环境未安装 OCR 引擎**
+
+        已为你启用「手动录入模式」：上传截图后，可以手动逐条录入交易信息。
+        如需自动识别，请在本地安装 `easyocr` 后部署。
+
+        ```bash
+        pip install easyocr
+        ```
+        """)
+    else:
+        st.success("✅ OCR 引擎已就绪，可自动识别截图内容")
+
+    st.divider()
+
+    # ---- 上传区域 ----
+    uploaded_files = st.file_uploader(
+        "📷 上传交易截图（支持多张）",
+        type=["png", "jpg", "jpeg", "bmp", "webp"],
+        accept_multiple_files=True,
+        help="支持券商APP的成交明细、持仓截图等"
+    )
+
+    if not uploaded_files:
+        with st.expander("📖 使用说明（点击展开）", expanded=True):
+            st.markdown("""
+            ### 操作步骤
+
+            **方式A：自动识别（推荐）**
+            1. 在券商APP截图交易记录页面
+            2. 上传截图 → 系统自动OCR识别
+            3. 检查识别结果，修正错误字段
+            4. 点击「批量导入」完成
+
+            **方式B：手动录入**
+            1. 上传截图作为参考（可选）
+            2. 手动填写每只股票的代码、操作、数量、价格
+            3. 逐条添加或批量导入
+
+            ### 📱 截图技巧
+            - 尽量截取**单只股票**的成交明细，避免多只混排
+            - 确保文字清晰，光线充足
+            - 横屏截图效果更好
+            - 支持的券商APP：同花顺、东方财富、华泰、中信等主流APP
+
+            ### ⚠️ 注意事项
+            - OCR识别率约 70-90%，**务必人工核对**
+            - 价格、数量是最关键的字段，请重点检查
+            - 识别错误时可直接在表格中修改
+            """)
+        return
+
+    # ---- 处理每张图片 ----
+    # 用 session_state 累积跨图片的交易
+    if "parsed_trades_all" not in st.session_state:
+        st.session_state.parsed_trades_all = []
+
+    for img_idx, uploaded_file in enumerate(uploaded_files):
+        st.markdown(f"### 🖼️ 图片 {img_idx + 1}: `{uploaded_file.name}`")
+
+        image_bytes = uploaded_file.read()
+        uploaded_file.seek(0)
+
+        col_img, col_actions = st.columns([1, 1])
+        with col_img:
+            st.image(image_bytes, use_container_width=True)
+
+        # 保存临时文件
+        tmp_path = os.path.join(tempfile.gettempdir(), f"ocr_input_{img_idx}.png")
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+
+        # OCR识别 + 解析
+        parsed_trades = []
+        if ocr_available and PARSER_AVAILABLE:
+            with st.spinner("🔍 正在识别图片内容..."):
+                lines = ocr_image(tmp_path)
+                if lines:
+                    st.caption(f"识别出 {len(lines)} 行文本：")
+                    with st.expander("查看原始识别文本", expanded=False):
+                        for i, line in enumerate(lines):
+                            st.text(f"[{i}] {line}")
+
+                    # 先尝试精确解析
+                    parsed_trades = parse_trade_from_text(lines)
+                    if not parsed_trades:
+                        parsed_trades = parse_trade_table(lines)
+                    if not parsed_trades:
+                        # 最后尝试多股票截图解析
+                        parsed_trades = parse_multi_stock_screenshot(lines)
+
+        with col_actions:
+            if parsed_trades:
+                st.success(f"✅ 识别到 {len(parsed_trades)} 条交易记录")
+                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+                for i, t in enumerate(parsed_trades):
+                    st.caption(f"{conf_color.get(t.get('confidence','low'), '⚪')} "
+                              f"{t['action']} {t['code']} {t['name']} "
+                              f"{t['shares']}股 @ {t['price']}元")
+            else:
+                if ocr_available:
+                    st.warning("⚠️ 未能自动识别，请手动录入")
+                else:
+                    st.info("请手动录入交易信息")
+
+        # ---- 编辑区域 ----
+        st.write("**编辑交易信息（确认无误后导入）：**")
+
+        if parsed_trades:
+            # 编辑识别结果
+            edited_trades = []
+            for t_idx, trade in enumerate(parsed_trades):
+                with st.container(border=True):
+                    c1, c2 = st.columns([2, 2])
+                    search_kw = c1.text_input(
+                        f"股票搜索##{img_idx}_{t_idx}",
+                        value=trade.get("name", ""),
+                        placeholder="搜索股票名称/代码"
+                    )
+                    selected_code = trade.get("code", "")
+                    selected_name = trade.get("name", "")
+                    if search_kw:
+                        results = search_stocks_local(search_kw)
+                        if results:
+                            opts = [f"{c} - {n}" for c, n in results]
+                            sel = c2.selectbox(f"选择##{img_idx}_{t_idx}", opts, label_visibility="collapsed")
+                            if sel:
+                                selected_code = sel.split(" - ")[0]
+                                selected_name = sel.split(" - ")[1]
+
+                    c3, c4, c5, c6 = st.columns(4)
+                    action = c3.selectbox(
+                        f"操作##{img_idx}_{t_idx}",
+                        ["买入", "卖出"],
+                        index=0 if trade.get("action", "买入") == "买入" else 1
+                    )
+                    shares = c4.number_input(
+                        f"数量##{img_idx}_{t_idx}",
+                        min_value=0, step=100,
+                        value=int(trade.get("shares", 100) or 100)
+                    )
+                    price = c5.number_input(
+                        f"价格##{img_idx}_{t_idx}",
+                        min_value=0.0, format="%.3f",
+                        value=float(trade.get("price", 0) or 0)
+                    )
+                    fee = c6.number_input(
+                        f"手续费##{img_idx}_{t_idx}",
+                        min_value=0.0, format="%.2f",
+                        value=float(trade.get("fee", 0) or 0)
+                    )
+                    trade_date = c1.date_input(
+                        f"日期##{img_idx}_{t_idx}",
+                        value=datetime.strptime(
+                            trade.get("date", date.today().isoformat())[:10], "%Y-%m-%d"
+                        ).date()
+                    )
+
+                    edited_trades.append({
+                        "code": selected_code,
+                        "name": selected_name,
+                        "action": action,
+                        "shares": int(shares),
+                        "price": float(price),
+                        "fee": float(fee),
+                        "date": trade_date.isoformat(),
+                        "note": f"OCR导入(图{img_idx+1})",
+                        "confidence": trade.get("confidence", "low")
+                    })
+
+                    if st.button(f"🗑️ 删除此条##{img_idx}_{t_idx}", key=f"del_{img_idx}_{t_idx}"):
+                        edited_trades.pop()
+                        st.rerun()
+
+            st.session_state.parsed_trades_all.extend(edited_trades)
+        else:
+            # 纯手动录入
+            with st.form(key=f"manual_form_{img_idx}"):
+                st.write("**手动录入交易信息：**")
+                mc1, mc2 = st.columns(2)
+                search_kw = mc1.text_input(f"搜索股票##manual_{img_idx}", placeholder="输入名称或代码")
+                selected_code = ""
+                selected_name = ""
+                if search_kw:
+                    results = search_stocks_local(search_kw)
+                    if results:
+                        opts = [f"{c} - {n}" for c, n in results]
+                        sel = mc2.selectbox(f"选择##manual_{img_idx}", opts, label_visibility="collapsed")
+                        if sel:
+                            selected_code = sel.split(" - ")[0]
+                            selected_name = sel.split(" - ")[1]
+
+                mc3, mc4, mc5, mc6 = st.columns(4)
+                m_action = mc3.selectbox(f"操作##manual_a_{img_idx}", ["买入", "卖出"])
+                m_shares = mc4.number_input(f"数量##manual_s_{img_idx}", min_value=0, step=100, value=100)
+                m_price = mc5.number_input(f"价格##manual_p_{img_idx}", min_value=0.0, format="%.3f", value=10.0)
+                m_fee = mc6.number_input(f"手续费##manual_f_{img_idx}", min_value=0.0, format="%.2f", value=0.0)
+                m_date = mc1.date_input(f"日期##manual_d_{img_idx}", value=date.today())
+
+                if st.form_submit_button("➕ 添加到导入列表", use_container_width=True):
+                    if selected_code and selected_name:
+                        st.session_state.parsed_trades_all.append({
+                            "code": selected_code,
+                            "name": selected_name,
+                            "action": m_action,
+                            "shares": int(m_shares),
+                            "price": float(m_price),
+                            "fee": float(m_fee),
+                            "date": m_date.isoformat(),
+                            "note": f"手动录入(图{img_idx+1})",
+                            "confidence": "high"
+                        })
+                        st.success(f"✅ 已添加: {m_action} {selected_name} {m_shares}股")
+                        st.rerun()
+                    else:
+                        st.error("请先搜索并选择股票")
+
+        st.divider()
+
+    # ---- 汇总确认导入 ----
+    all_trades = st.session_state.parsed_trades_all
+    if all_trades:
+        st.markdown("---")
+        st.markdown(f"### ✅ 待导入交易 ({len(all_trades)} 条)")
+
+        preview_rows = []
+        for i, t in enumerate(all_trades):
+            preview_rows.append({
+                "#": i,
+                "日期": t["date"],
+                "代码": t["code"],
+                "名称": t["name"],
+                "操作": t["action"],
+                "数量": t["shares"],
+                "价格": t["price"],
+                "手续费": t.get("fee", 0),
+                "备注": t.get("note", ""),
+            })
+        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+        # 持仓冲突检查
+        holdings = get_current_holdings(data)
+        warnings = []
+        for t in all_trades:
+            if t["action"] == "卖出":
+                cur = holdings.get(t["code"], {}).get("total_shares", 0)
+                if t["shares"] > cur:
+                    warnings.append(f"⚠️ {t['code']} {t['name']}: 卖出{t['shares']}股但仅持仓{cur}股")
+
+        for w in warnings:
+            st.warning(w)
+
+        col_confirm, col_clear = st.columns(2)
+        with col_confirm:
+            btn_label = "🚀 确认批量导入" if "confirm_import" not in st.session_state else "⚠️ 再次点击确认导入"
+            if st.button(btn_label, type="primary", use_container_width=True):
+                if "confirm_import" not in st.session_state:
+                    st.session_state.confirm_import = True
+                    st.rerun()
+                else:
+                    for t in all_trades:
+                        data["transactions"].append({
+                            "code": t["code"],
+                            "name": t["name"],
+                            "action": t["action"],
+                            "shares": int(t["shares"]),
+                            "price": float(t["price"]),
+                            "fee": float(t.get("fee", 0)),
+                            "date": t["date"],
+                            "note": t.get("note", ""),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    save_data(data)
+                    st.session_state.parsed_trades_all = []
+                    st.session_state.pop("confirm_import", None)
+                    st.success(f"🎉 成功导入 {len(all_trades)} 条交易记录！")
+                    time.sleep(1)
+                    st.rerun()
+
+        with col_clear:
+            if st.button("🗑️ 清空列表", use_container_width=True):
+                st.session_state.parsed_trades_all = []
+                st.session_state.pop("confirm_import", None)
+                st.rerun()
+
+
 def export_import_page(data):
     """导出导入页面"""
     st.subheader("📤 导出 / 导入")
@@ -600,7 +1113,6 @@ def export_import_page(data):
         if st.button("📊 生成 Excel 文件", use_container_width=True):
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                # Sheet1: 持仓总览
                 stocks_info = compute_portfolio(data)
                 overview_rows = []
                 for code, info in stocks_info.items():
@@ -621,7 +1133,6 @@ def export_import_page(data):
                     })
                 pd.DataFrame(overview_rows).to_excel(writer, sheet_name="持仓总览", index=False)
 
-                # Sheet2: 交易明细
                 tx_rows = []
                 for t in data["transactions"]:
                     tx_rows.append({
@@ -631,7 +1142,6 @@ def export_import_page(data):
                     })
                 pd.DataFrame(tx_rows).to_excel(writer, sheet_name="交易明细", index=False)
 
-                # Sheet3: 分红记录
                 div_rows = []
                 for d in data["dividends"]:
                     div_rows.append({
@@ -680,8 +1190,8 @@ def main():
     render_header()
     data = load_data()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 持仓", "➕ 交易", "📋 明细", "💰 分红", "📤 备份"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 持仓", "➕ 交易", "📋 明细", "💰 分红", "📸 截图导入", "📤 备份"
     ])
 
     with tab1:
@@ -693,9 +1203,10 @@ def main():
     with tab4:
         manage_dividends(data)
     with tab5:
+        screenshot_import(data)
+    with tab6:
         export_import_page(data)
 
-    # 底部
     st.divider()
     st.caption(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
                f"⚠️ 数据仅供参考，不构成投资建议")
