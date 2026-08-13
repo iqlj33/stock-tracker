@@ -1,8 +1,6 @@
-# Force rebuild trigger 20260812
 streamlit
 pandas
 plotly
 requests
 openpyxl
-rapidocr_onnxruntime
 Pillow

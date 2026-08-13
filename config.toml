@@ -1,14 +1,11 @@
 [server]
 headless = true
-address = "0.0.0.0"
 port = 8501
+fileWatcherType = "auto"
 
 [theme]
-primaryColor = "#2a5298"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
+primaryColor = "#FF4B4B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
 textColor = "#262730"
-font = "sans-serif"
-
-[client]
-toolbarMode = "minimal"
+font = "sans serif"
