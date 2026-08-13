@@ -235,7 +235,7 @@ def add_transaction_tab(data):
         with col3:
             price = st.number_input(
                 "价格（元）", min_value=0.01, step=0.01, format="%.3f",
-                key="price_input", value=0.0
+                key="price_input", value=0.01
             )
         with col4:
             # 手续费默认5
