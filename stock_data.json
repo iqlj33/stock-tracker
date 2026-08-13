@@ -1,1 +1,16 @@
-{"stocks": {}, "transactions": [], "dividends": []}
+{
+  "stocks": {},
+  "transactions": [
+    {
+      "code": "000887",
+      "name": "中鼎股份",
+      "action": "买入",
+      "shares": 200,
+      "price": 19.65,
+      "fee": 5.0,
+      "date": "2026-08-11",
+      "timestamp": "2026-08-13T06:56:29.478963"
+    }
+  ],
+  "dividends": []
+}
